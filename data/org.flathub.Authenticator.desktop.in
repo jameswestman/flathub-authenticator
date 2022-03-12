@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Flathub Authenticator
+Exec=flathub-authenticator
+DBusActivatable=true
+NoDisplay=true
+Terminal=false
+Type=Application

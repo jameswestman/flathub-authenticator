@@ -1,0 +1,3 @@
+option('frontend_url',
+       type: 'string', value: 'http://localhost:3000',
+       description: 'URL of the flathub website')
