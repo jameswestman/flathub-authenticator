@@ -61,23 +61,31 @@ on_request_finished (G_GNUC_UNUSED SoupServer        *server,
 
 static void
 handle_return_request (G_GNUC_UNUSED SoupServer        *server,
-                       G_GNUC_UNUSED SoupMessage       *msg,
+                       SoupMessage                     *msg,
                        G_GNUC_UNUSED const char        *path,
                        GHashTable                      *query,
                        G_GNUC_UNUSED SoupClientContext *client,
                        gpointer                         user_data)
 {
   ActiveRequest *req = (ActiveRequest *)user_data;
+  SoupMessageHeaders *headers;
   GVariant *result = NULL;
   char *token;
 
   flatpak_authenticator_request_emit_webflow_done (req->request_impl, g_variant_new ("a{sv}", NULL));
+
+  g_object_get (msg, "response-headers", &headers, NULL);
+  soup_message_headers_replace (headers, "Access-Control-Allow-Origin", FRONTEND_URL);
 
   if (query == NULL || !g_hash_table_contains (query, "token"))
     {
       g_debug ("return request did not contain token");
       result = g_variant_new_parsed ("{'error-message': <'%s'>}", "server did not respond with token");
       flatpak_authenticator_request_emit_response (req->request_impl, 2, result);
+
+      soup_message_set_status (msg, SOUP_STATUS_BAD_REQUEST);
+      soup_message_set_response (msg, NULL, SOUP_MEMORY_STATIC, NULL, 0);
+
       return;
     }
 
@@ -86,9 +94,8 @@ handle_return_request (G_GNUC_UNUSED SoupServer        *server,
   result = g_variant_new_parsed ("{'tokens': <{%s: %^as}>}", token, req->refs);
   flatpak_authenticator_request_emit_response (req->request_impl, 0, result);
 
-  g_debug ("Redirecting to " FRONTEND_URL "/purchase/finished");
-  soup_message_set_status (msg, SOUP_STATUS_SEE_OTHER);
-  soup_message_set_redirect (msg, SOUP_STATUS_SEE_OTHER, FRONTEND_URL "/purchase/finished");
+  soup_message_set_status (msg, SOUP_STATUS_OK);
+  soup_message_set_response (msg, NULL, SOUP_MEMORY_STATIC, NULL, 0);
 }
 
 
@@ -175,7 +182,7 @@ handle_request_ref_token (FlatpakAuthenticator     *authenticator,
       return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
-  soup_server_add_handler (request->return_server, NULL, handle_return_request, request, NULL);
+  soup_server_add_handler (request->return_server, "/success", handle_return_request, request, NULL);
 
   /* When all requests are finished, free the request info. We can't do this in
    * handle_return_request because that would interrupt the ongoing HTTP response. */
@@ -187,7 +194,7 @@ handle_request_ref_token (FlatpakAuthenticator     *authenticator,
   return_uri = soup_uri_to_string ((SoupURI *)g_slist_nth_data (uris, 0), FALSE);
 
   /* Emit the Webflow signal */
-  url = g_strdup_printf (FRONTEND_URL "/purchase?refs=%s&return=%s", ref_string, return_uri);
+  url = g_strdup_printf (FRONTEND_URL "/purchase?refs=%s&return=%ssuccess", ref_string, return_uri);
   g_debug ("Redirecting to %s", url);
   flatpak_authenticator_request_emit_webflow (impl, url, g_variant_new ("a{sv}", NULL));
 
