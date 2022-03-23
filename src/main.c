@@ -194,7 +194,7 @@ handle_request_ref_token (FlatpakAuthenticator     *authenticator,
   return_uri = soup_uri_to_string ((SoupURI *)g_slist_nth_data (uris, 0), FALSE);
 
   /* Emit the Webflow signal */
-  url = g_strdup_printf (FRONTEND_URL "/purchase?refs=%s&return=%ssuccess", ref_string, return_uri);
+  url = g_strdup_printf (FRONTEND_URL "/purchase?refs=%s&return=%s", ref_string, return_uri);
   g_debug ("Redirecting to %s", url);
   flatpak_authenticator_request_emit_webflow (impl, url, g_variant_new ("a{sv}", NULL));
 
