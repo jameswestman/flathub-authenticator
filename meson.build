@@ -12,12 +12,16 @@ gnome = import('gnome')
 
 config_h = configuration_data()
 config_h.set_quoted('FRONTEND_URL', get_option('frontend_url'))
+config_h.set_quoted('BACKEND_URL', get_option('api_url'))
+config_h.set_quoted('PROGRAM_NAME', meson.project_name())
+config_h.set_quoted('PROGRAM_VERSION', meson.project_version())
 configure_file(
   output: 'flathub_authenticator-config.h',
   configuration: config_h,
 )
 add_project_arguments([
   '-I' + meson.build_root(),
+  '-DG_LOG_DOMAIN="@0@"'.format(meson.project_name()),
 ], language: 'c')
 
 

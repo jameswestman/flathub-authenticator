@@ -18,6 +18,7 @@
 
 #include <glib/gi18n.h>
 #include <libsoup/soup.h>
+#include <json-glib/json-glib.h>
 
 #include "flathub_authenticator-config.h"
 #include "org.freedesktop.Flatpak.Authenticator.h"
@@ -31,7 +32,9 @@ static int active_requests = 0;
 typedef struct {
   SoupServer *return_server;
   FlatpakAuthenticatorRequest *request_impl;
+  char *update_token;
   GStrv refs;
+  gboolean didWebflow;
 } ActiveRequest;
 
 
@@ -41,62 +44,39 @@ active_request_free (ActiveRequest *req)
   g_clear_object (&req->request_impl);
   g_clear_object (&req->return_server);
   g_clear_pointer (&req->refs, g_strfreev);
+  g_clear_pointer (&req->update_token, g_free);
   g_free (req);
   active_requests --;
 }
 
 
-static void
-on_request_finished (G_GNUC_UNUSED SoupServer        *server,
-                     G_GNUC_UNUSED SoupMessage       *msg,
-                     G_GNUC_UNUSED SoupClientContext *client,
-                     gpointer                         user_data)
-{
-  ActiveRequest *req = (ActiveRequest *)user_data;
+static void redirect_to_frontend (ActiveRequest *request);
+static void on_download_token_request_sent (GObject      *source_object,
+                                            GAsyncResult *res,
+                                            gpointer      user_data);
+static void clear_token (ActiveRequest *request);
+static void end_request_with_error (ActiveRequest *req,
+                                    const char    *error_message);
+static void end_request_with_token (ActiveRequest *req,
+                                    const char     *token);
+static void end_request_with_cancellation (ActiveRequest *req);
+static void handle_return_request (SoupServer        *server,
+                                   SoupMessage       *msg,
+                                   const char        *path,
+                                   GHashTable        *query,
+                                   SoupClientContext *client,
+                                   gpointer           user_data);
+static void handle_cancel_request (SoupServer        *server,
+                                   SoupMessage       *msg,
+                                   const char        *path,
+                                   GHashTable        *query,
+                                   SoupClientContext *client,
+                                   gpointer           user_data);
+static void get_download_token (ActiveRequest *req);
 
-  g_debug ("Request finished");
-  active_request_free (req);
-}
-
-
-static void
-handle_return_request (G_GNUC_UNUSED SoupServer        *server,
-                       SoupMessage                     *msg,
-                       G_GNUC_UNUSED const char        *path,
-                       GHashTable                      *query,
-                       G_GNUC_UNUSED SoupClientContext *client,
-                       gpointer                         user_data)
-{
-  ActiveRequest *req = (ActiveRequest *)user_data;
-  SoupMessageHeaders *headers;
-  GVariant *result = NULL;
-  char *token;
-
-  flatpak_authenticator_request_emit_webflow_done (req->request_impl, g_variant_new ("a{sv}", NULL));
-
-  g_object_get (msg, "response-headers", &headers, NULL);
-  soup_message_headers_replace (headers, "Access-Control-Allow-Origin", FRONTEND_URL);
-
-  if (query == NULL || !g_hash_table_contains (query, "token"))
-    {
-      g_debug ("return request did not contain token");
-      result = g_variant_new_parsed ("{'error-message': <'%s'>}", "server did not respond with token");
-      flatpak_authenticator_request_emit_response (req->request_impl, 2, result);
-
-      soup_message_set_status (msg, SOUP_STATUS_BAD_REQUEST);
-      soup_message_set_response (msg, NULL, SOUP_MEMORY_STATIC, NULL, 0);
-
-      return;
-    }
-
-  token = g_hash_table_lookup (query, "token");
-  g_debug ("Received download token: %s", token);
-  result = g_variant_new_parsed ("{'tokens': <{%s: %^as}>}", token, req->refs);
-  flatpak_authenticator_request_emit_response (req->request_impl, 0, result);
-
-  soup_message_set_status (msg, SOUP_STATUS_OK);
-  soup_message_set_response (msg, NULL, SOUP_MEMORY_STATIC, NULL, 0);
-}
+static void on_download_token_message_read (GObject      *object,
+                                            GAsyncResult *result,
+                                            gpointer      user_data);
 
 
 static gboolean
@@ -104,12 +84,12 @@ handle_close (FlatpakAuthenticator  *authenticator,
               GDBusMethodInvocation *invocation,
               gpointer               user_data)
 {
-  ActiveRequest *req = (ActiveRequest *)user_data;
+  ActiveRequest *request = (ActiveRequest *)user_data;
 
   g_assert (IS_FLATPAK_AUTHENTICATOR (authenticator));
   g_assert (G_IS_DBUS_METHOD_INVOCATION (invocation));
 
-  active_request_free (req);
+  end_request_with_cancellation (request);
 
   return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
@@ -133,11 +113,7 @@ handle_request_ref_token (FlatpakAuthenticator     *authenticator,
   g_autoptr(FlatpakAuthenticatorRequest) impl = NULL;
   g_autofree char *obj_path = NULL;
   g_autofree char *sender = NULL;
-  g_autofree char *ref_string = NULL;
-  g_autofree char *url = NULL;
-  g_autofree char *return_uri = NULL;
   g_autoptr(GError) error = NULL;
-  g_autoslist(SoupURI) uris = NULL;
   ActiveRequest *request;
 
   GVariant *result = NULL;
@@ -153,7 +129,6 @@ handle_request_ref_token (FlatpakAuthenticator     *authenticator,
     g_strv_builder_add (ref_name_builder, ref);
 
   ref_names = g_strv_builder_end (ref_name_builder);
-  ref_string = g_strjoinv (";", ref_names);
 
   /* Create the request object */
   sender = g_strdup (g_dbus_method_invocation_get_sender (invocation));
@@ -166,45 +141,292 @@ handle_request_ref_token (FlatpakAuthenticator     *authenticator,
 
   g_dbus_object_manager_server_export (manager, object);
 
-  /* Create a web server to listen for the end of the webflow */
   request = g_new0 (ActiveRequest, 1);
-  request->return_server = soup_server_new (NULL, NULL);
+  active_requests ++;
   request->request_impl = g_object_ref (impl);
   request->refs = g_strdupv (ref_names);
 
   g_signal_connect (impl, "handle-close", G_CALLBACK (handle_close), request);
 
+  /* Return the path of the request object */
+  result = g_variant_new_parsed ("(%o,)", obj_path);
+  g_dbus_method_invocation_return_value (invocation, result);
+
+  redirect_to_frontend (request);
+
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
+}
+
+
+static void
+redirect_to_frontend (ActiveRequest *request)
+{
+  g_autoptr(GError) error = NULL;
+  g_autoslist(SoupURI) uris = NULL;
+  g_autofree char *url = NULL;
+  g_autofree char *return_uri = NULL;
+  g_autofree char *ref_string = NULL;
+
+  /* Prevent infinite loops if something goes wrong somewhere */
+  if (request->didWebflow)
+    {
+      end_request_with_error (request, "previous webflow failed, not going to try again");
+      return;
+    }
+
+  /* Create a web server to listen for the end of the webflow */
+  request->return_server = soup_server_new (NULL, NULL);
   soup_server_listen_local (request->return_server, 0, 0, &error);
   if (error != NULL)
     {
-      g_prefix_error (&error, "could not listen for webflow response");
-      g_dbus_method_invocation_return_gerror (invocation, error);
-      return G_DBUS_METHOD_INVOCATION_HANDLED;
+      end_request_with_error (request, "failed to create socket to listen for webflow response");
+      return;
     }
 
   soup_server_add_handler (request->return_server, "/success", handle_return_request, request, NULL);
+  soup_server_add_handler (request->return_server, "/cancel", handle_cancel_request, request, NULL);
 
-  /* When all requests are finished, free the request info. We can't do this in
-   * handle_return_request because that would interrupt the ongoing HTTP response. */
-  g_signal_connect (request->return_server, "request-finished", G_CALLBACK (on_request_finished), request);
-  g_signal_connect (request->return_server, "request-aborted", G_CALLBACK (on_request_finished), request);
+  /* We need to hold a reference to the server whenever a request is open. Otherwise, we might free the ActiveRequest
+     (and thus the server) while it's still sending a response. */
+  g_signal_connect (request->return_server, "request-started", G_CALLBACK (g_object_ref), NULL);
+  g_signal_connect (request->return_server, "request-finished", G_CALLBACK (g_object_unref), NULL);
+  g_signal_connect (request->return_server, "request-aborted", G_CALLBACK (g_object_unref), NULL);
 
   uris = soup_server_get_uris (request->return_server);
   g_assert (g_slist_length (uris) > 0);
   return_uri = soup_uri_to_string ((SoupURI *)g_slist_nth_data (uris, 0), FALSE);
 
   /* Emit the Webflow signal */
+  request->didWebflow = TRUE;
+  ref_string = g_strjoinv (";", request->refs);
   url = g_strdup_printf (FRONTEND_URL "/purchase?refs=%s&return=%s", ref_string, return_uri);
   g_debug ("Redirecting to %s", url);
-  flatpak_authenticator_request_emit_webflow (impl, url, g_variant_new ("a{sv}", NULL));
+  flatpak_authenticator_request_emit_webflow (request->request_impl, url, g_variant_new ("a{sv}", NULL));
+}
 
-  /* Return the path of the request object */
-  result = g_variant_new_parsed ("(%o,)", obj_path);
-  g_dbus_method_invocation_return_value (invocation, result);
 
-  active_requests ++;
+static void
+handle_return_request (G_GNUC_UNUSED SoupServer        *server,
+                       SoupMessage                     *msg,
+                       G_GNUC_UNUSED const char        *path,
+                       GHashTable                      *query,
+                       G_GNUC_UNUSED SoupClientContext *client,
+                       gpointer                         user_data)
+{
+  ActiveRequest *req = (ActiveRequest *)user_data;
+  g_autoptr(SoupMessageHeaders) headers = NULL;
+  char *token;
 
-  return G_DBUS_METHOD_INVOCATION_HANDLED;
+  g_debug ("Handling return request");
+
+  flatpak_authenticator_request_emit_webflow_done (req->request_impl, g_variant_new ("a{sv}", NULL));
+
+  g_object_get (msg, "response-headers", &headers, NULL);
+  soup_message_headers_replace (headers, "Access-Control-Allow-Origin", FRONTEND_URL);
+
+  if (query == NULL || !g_hash_table_contains (query, "token"))
+    {
+      end_request_with_error (req, "server did not respond with token");
+
+      soup_message_set_status (msg, SOUP_STATUS_BAD_REQUEST);
+      soup_message_set_response (msg, NULL, SOUP_MEMORY_STATIC, NULL, 0);
+
+      return;
+    }
+
+  g_debug ("Received update token");
+
+  token = g_hash_table_lookup (query, "token");
+  g_assert (req->update_token == NULL);
+  req->update_token = g_strdup (token);
+
+  get_download_token (req);
+
+  soup_message_set_status (msg, SOUP_STATUS_OK);
+  soup_message_set_response (msg, NULL, SOUP_MEMORY_STATIC, NULL, 0);
+}
+
+
+static void
+handle_cancel_request (G_GNUC_UNUSED SoupServer        *server,
+                       SoupMessage                     *msg,
+                       G_GNUC_UNUSED const char        *path,
+                       G_GNUC_UNUSED GHashTable        *query,
+                       G_GNUC_UNUSED SoupClientContext *client,
+                       gpointer                         user_data)
+{
+  ActiveRequest *request = (ActiveRequest *)user_data;
+  g_autoptr(SoupMessageHeaders) headers = NULL;
+
+  g_debug ("Handling cancel request");
+
+  flatpak_authenticator_request_emit_webflow_done (request->request_impl, g_variant_new ("a{sv}", NULL));
+
+  end_request_with_cancellation (request);
+
+  g_object_get (msg, "response-headers", &headers, NULL);
+  soup_message_headers_replace (headers, "Access-Control-Allow-Origin", FRONTEND_URL);
+
+  soup_message_set_status (msg, SOUP_STATUS_OK);
+  soup_message_set_response (msg, NULL, SOUP_MEMORY_STATIC, NULL, 0);
+}
+
+
+static void
+get_download_token (ActiveRequest *request)
+{
+  g_autoptr(SoupSession) session = NULL;
+  g_autoptr(SoupMessage) msg = NULL;
+  g_autoptr(JsonBuilder) builder = NULL;
+  g_autoptr(JsonNode) node = NULL;
+  g_autofree char *request_body = NULL;
+  gsize i, n;
+
+  g_debug ("Getting download token");
+
+  builder = json_builder_new ();
+  json_builder_begin_object (builder);
+    json_builder_set_member_name (builder, "appids");
+    json_builder_begin_array (builder);
+      for (i = 0, n = g_strv_length (request->refs); i < n; i ++)
+        json_builder_add_string_value (builder, request->refs[i]);
+    json_builder_end_array (builder);
+
+    json_builder_set_member_name (builder, "update_token");
+    json_builder_add_string_value (builder, request->update_token);
+  json_builder_end_object (builder);
+  node = json_builder_get_root (builder);
+  request_body = json_to_string (node, FALSE);
+
+  msg = soup_message_new (SOUP_METHOD_POST, BACKEND_URL "/purchases/generate-download-token");
+  soup_message_set_request (msg,
+                            "application/json",
+                            SOUP_MEMORY_COPY,
+                            request_body,
+                            strlen (request_body));
+
+  session = soup_session_new ();
+  g_object_set (G_OBJECT (session),
+                "user-agent", PROGRAM_NAME " " PROGRAM_VERSION,
+                NULL);
+
+  soup_session_send_async (session,
+                           msg,
+                           NULL,
+                           on_download_token_request_sent,
+                           request);
+}
+
+
+static void
+on_download_token_request_sent (GObject      *object,
+                                GAsyncResult *res,
+                                gpointer      user_data)
+{
+  SoupSession *session = SOUP_SESSION (object);
+  ActiveRequest *request = (ActiveRequest *)user_data;
+  g_autoptr(JsonParser) parser = NULL;
+  g_autoptr(GError) error = NULL;
+  g_autoptr(GInputStream) stream = NULL;
+  g_autoptr(GOutputStream) output_stream = NULL;
+
+  if (!(stream = soup_session_send_finish (session, res, &error)))
+    {
+      clear_token (request);
+      return;
+    }
+
+  parser = json_parser_new ();
+  json_parser_load_from_stream_async (parser,
+                                      stream,
+                                      NULL,
+                                      on_download_token_message_read,
+                                      request);
+}
+
+
+static void
+on_download_token_message_read (GObject      *source_object,
+                                GAsyncResult *result,
+                                gpointer      user_data)
+{
+  JsonParser *parser = JSON_PARSER (source_object);
+  g_autoptr(GError) error = NULL;
+  g_autoptr(GBytes) bytes = NULL;
+  ActiveRequest *request = (ActiveRequest *)user_data;
+  JsonNode *node;
+  JsonObject *object;
+
+  if (!json_parser_load_from_stream_finish (parser, result, &error))
+    goto failed;
+
+  node = json_parser_get_root (parser);
+
+  if (!JSON_NODE_HOLDS_OBJECT (node))
+    goto failed;
+
+  object = json_node_get_object (node);
+  if (json_object_has_member (object, "missing_appids"))
+    {
+      redirect_to_frontend (request);
+      return;
+    }
+
+  if ((node = json_object_get_member (object, "token")))
+    {
+      if (!JSON_NODE_HOLDS_VALUE (node) || json_node_get_value_type (node) != G_TYPE_STRING)
+        goto failed;
+
+      end_request_with_token (request, json_node_get_string (node));
+      return;
+    }
+
+failed:
+  clear_token (request);
+}
+
+
+static void
+clear_token (ActiveRequest *request)
+{
+  g_debug ("Clearing update token");
+  g_clear_pointer (&request->update_token, g_free);
+  redirect_to_frontend (request);
+}
+
+
+static void
+end_request_with_error (ActiveRequest *req,
+                        const char    *error_message)
+{
+  GVariant *result = g_variant_new_parsed ("{'error-message': <{'error-message': %s}>}", error_message);
+  flatpak_authenticator_request_emit_response (req->request_impl, 2, result);
+
+  g_debug ("Request ended in failure: %s", error_message);
+  active_request_free (req);
+}
+
+
+static void
+end_request_with_token (ActiveRequest *request,
+                        const char    *token)
+{
+  GVariant *result = g_variant_new_parsed ("{'tokens': <{%s: %^as}>}", token, request->refs);
+  flatpak_authenticator_request_emit_response (request->request_impl, 0, result);
+
+  g_debug ("Request succeeded.");
+  active_request_free (request);
+}
+
+
+static void
+end_request_with_cancellation (ActiveRequest *request)
+{
+  GVariant *result = g_variant_new_parsed ("@a{sv} {}");
+  flatpak_authenticator_request_emit_response (request->request_impl, 1, result);
+
+  g_debug ("Request cancelled by user.");
+  active_request_free (request);
 }
 
 
