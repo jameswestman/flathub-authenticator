@@ -19,6 +19,7 @@
 #include <glib/gi18n.h>
 #include <libsoup/soup.h>
 #include <json-glib/json-glib.h>
+#include <libsecret/secret.h>
 
 #include "flathub_authenticator-config.h"
 #include "org.freedesktop.Flatpak.Authenticator.h"
@@ -79,6 +80,53 @@ static void on_download_token_message_read (GObject      *object,
                                             gpointer      user_data);
 
 
+static const SecretSchema secret_schema = {
+  "org.flathub.Authenticator",
+  SECRET_SCHEMA_NONE,
+  {
+    { "NULL", 0 },
+  },
+};
+
+static void
+store_update_token (const char *update_token)
+{
+  g_autoptr(GError) error = NULL;
+
+  g_debug ("Storing update token");
+
+  if (!secret_password_store_sync (&secret_schema, SECRET_COLLECTION_DEFAULT,
+                                   "Update token for Flathub", update_token, NULL, &error,
+                                   NULL))
+    g_warning ("Failed to store the update token: %s", error->message);
+}
+
+/* Retrieves the update token, which must be freed with secret_password_free() if it is not NULL. */
+static char *
+retrieve_update_token ()
+{
+  g_autoptr(GError) error = NULL;
+  char *token;
+
+  g_debug ("Retrieving update token...");
+
+  token = secret_password_lookup_sync (&secret_schema, NULL, &error, NULL);
+
+  if (error != NULL)
+    {
+      g_warning ("Failed to retrieve the update token: %s", error->message);
+      return NULL;
+    }
+
+  if (token == NULL)
+    g_debug ("No update token found.");
+  else
+    g_debug ("Found.");
+
+  return token;
+}
+
+
 static gboolean
 handle_close (FlatpakAuthenticator  *authenticator,
               GDBusMethodInvocation *invocation,
@@ -86,7 +134,7 @@ handle_close (FlatpakAuthenticator  *authenticator,
 {
   ActiveRequest *request = (ActiveRequest *)user_data;
 
-  g_assert (IS_FLATPAK_AUTHENTICATOR (authenticator));
+  g_assert (IS_FLATPAK_AUTHENTICATOR_REQUEST (authenticator));
   g_assert (G_IS_DBUS_METHOD_INVOCATION (invocation));
 
   end_request_with_cancellation (request);
@@ -115,6 +163,7 @@ handle_request_ref_token (FlatpakAuthenticator     *authenticator,
   g_autofree char *sender = NULL;
   g_autoptr(GError) error = NULL;
   ActiveRequest *request;
+  char *update_token = NULL;
 
   GVariant *result = NULL;
   GVariantIter iter;
@@ -152,7 +201,15 @@ handle_request_ref_token (FlatpakAuthenticator     *authenticator,
   result = g_variant_new_parsed ("(%o,)", obj_path);
   g_dbus_method_invocation_return_value (invocation, result);
 
-  redirect_to_frontend (request);
+  update_token = retrieve_update_token ();
+  if (update_token != NULL)
+    {
+      request->update_token = g_strdup (update_token);
+      secret_password_free (update_token);
+      get_download_token (request);
+    }
+  else
+    redirect_to_frontend (request);
 
   return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
@@ -239,6 +296,8 @@ handle_return_request (G_GNUC_UNUSED SoupServer        *server,
   token = g_hash_table_lookup (query, "token");
   g_assert (req->update_token == NULL);
   req->update_token = g_strdup (token);
+
+  store_update_token (token);
 
   get_download_token (req);
 
@@ -380,6 +439,9 @@ on_download_token_message_read (GObject      *source_object,
       end_request_with_token (request, json_node_get_string (node));
       return;
     }
+
+  if ((node = json_object_get_member (object, "update-token")))
+    store_update_token (json_node_get_string (node));
 
 failed:
   clear_token (request);

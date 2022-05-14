@@ -7,6 +7,7 @@ flathub_authenticator_deps = [
   dependency('gio-unix-2.0'),
   dependency('libsoup-2.4'),
   dependency('json-glib-1.0'),
+  dependency('libsecret-1'),
 ]
 
 gnome = import('gnome')
