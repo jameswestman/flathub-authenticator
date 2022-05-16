@@ -272,7 +272,7 @@ handle_return_request (G_GNUC_UNUSED SoupServer        *server,
 {
   ActiveRequest *req = (ActiveRequest *)user_data;
   g_autoptr(SoupMessageHeaders) headers = NULL;
-  char *token;
+  char *token, *download_token;
 
   g_debug ("Handling return request");
 
@@ -281,7 +281,7 @@ handle_return_request (G_GNUC_UNUSED SoupServer        *server,
   g_object_get (msg, "response-headers", &headers, NULL);
   soup_message_headers_replace (headers, "Access-Control-Allow-Origin", FRONTEND_URL);
 
-  if (query == NULL || !g_hash_table_contains (query, "token"))
+  if (query == NULL || !(g_hash_table_contains (query, "token") || g_hash_table_contains (query, "download-token")))
     {
       end_request_with_error (req, "server did not respond with token");
 
@@ -291,15 +291,26 @@ handle_return_request (G_GNUC_UNUSED SoupServer        *server,
       return;
     }
 
-  g_debug ("Received update token");
-
   token = g_hash_table_lookup (query, "token");
-  g_assert (req->update_token == NULL);
-  req->update_token = g_strdup (token);
+  if (token != NULL)
+    {
+      g_debug ("Received update token");
 
-  store_update_token (token);
+      g_clear_pointer (&req->update_token, g_free);
+      req->update_token = g_strdup (token);
 
-  get_download_token (req);
+      store_update_token (token);
+    }
+
+  download_token = g_hash_table_lookup (query, "download-token");
+  if (download_token != NULL)
+    {
+      g_debug ("Received download token");
+      end_request_with_token (req, download_token);
+      return;
+    }
+  else
+    get_download_token (req);
 
   soup_message_set_status (msg, SOUP_STATUS_OK);
   soup_message_set_response (msg, NULL, SOUP_MEMORY_STATIC, NULL, 0);
